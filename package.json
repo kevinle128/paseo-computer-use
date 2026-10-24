@@ -1,0 +1,28 @@
+{
+  "name": "@kevinle128/computer-use",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "embed:helper": "node scripts/embed-helper.mjs",
+    "typecheck": "node scripts/embed-helper.mjs && tsc --noEmit",
+    "test": "vitest run",
+    "test:swift": "swift test --package-path native/macos",
+    "lint": "oxlint"
+  },
+  "devDependencies": {
+    "@getpaseo/client": "file:../paseo/packages/client",
+    "@getpaseo/plugin": "file:../paseo/packages/plugin",
+    "@getpaseo/protocol": "file:../paseo/packages/protocol",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@types/node": "^20.9.0",
+    "@types/react": "~19.2.0",
+    "oxlint": "1.61.0",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6",
+    "zod": "4.4.3"
+  }
+}
