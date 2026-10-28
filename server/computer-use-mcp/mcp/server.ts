@@ -44,7 +44,7 @@ export class ComputerUseMcpServer {
   constructor(options: ComputerUseMcpServerOptions) {
     this.tools = options.tools;
     this.serverName = options.serverName ?? "paseo-computer";
-    this.serverVersion = options.serverVersion ?? "0.1.0";
+    this.serverVersion = options.serverVersion ?? "0.2.0";
   }
 
   async handleMessage(

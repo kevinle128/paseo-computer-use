@@ -10,7 +10,7 @@ export interface ActionSettlerOptions {
   post_action_sleep_ms?: number;
 }
 
-const defaultClock: ActionSettlerClock = {
+export const defaultClock: ActionSettlerClock = {
   now: () => performance.now(),
   sleep: async (ms: number) => {
     await sleep(ms);

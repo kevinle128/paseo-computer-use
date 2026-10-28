@@ -26,23 +26,26 @@ public final class InputDriver {
     private typealias GetPSNFn = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> Int32
     private typealias PostRecordFn = @convention(c) (UnsafePointer<ProcessSerialNumber>, UnsafePointer<UInt8>) -> Int32
 
-    private let skyLightHandle: UnsafeMutableRawPointer?
     private let setWindowLocationFn: SetWindowLocationFn?
     private let getPSNFn: GetPSNFn?
     private let postRecordFn: PostRecordFn?
 
-    public init() {
-        let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
-        self.skyLightHandle = handle
+    /// The window the last synthetic activation went to, and whether the key
+    /// window records went with it. A focus correction posts the same records
+    /// again, so the target keeps acting as the active app after the user's
+    /// app is brought back.
+    struct SyntheticActivation: Equatable {
+        let pid: pid_t
+        let windowId: Int
+        var madeKey: Bool
+    }
 
+    private let activationLock = NSLock()
+    private var lastActivation: SyntheticActivation?
+
+    public init() {
         func resolveSymbol(_ name: String) -> UnsafeMutableRawPointer? {
-            if let p = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) {
-                return p
-            }
-            if let h = handle, let p = dlsym(h, name) {
-                return p
-            }
-            return nil
+            PrivateSymbol.address(name)
         }
 
         if let sym = resolveSymbol("CGEventSetWindowLocation") ?? resolveSymbol("SLEventSetWindowLocation") {
@@ -101,9 +104,45 @@ public final class InputDriver {
     }
 
     public func focusWithoutRaise(pid: pid_t, windowId: Int) {
-        guard windowId > 0, let getPSNFn, let postRecordFn else { return }
-        var psn = ProcessSerialNumber()
-        guard getPSNFn(pid, &psn) == 0 else { return }
+        guard postActivationRecord(pid: pid, windowId: windowId) else { return }
+        remember(SyntheticActivation(pid: pid, windowId: windowId, madeKey: false))
+    }
+
+    private func remember(_ activation: SyntheticActivation) {
+        activationLock.lock()
+        defer { activationLock.unlock() }
+        if activation.madeKey, var last = lastActivation, last.pid == activation.pid, last.windowId == activation.windowId {
+            last.madeKey = true
+            lastActivation = last
+        } else {
+            lastActivation = activation
+        }
+    }
+
+    /// Posts again, to `pid`, the synthetic activation the last action posted
+    /// to it, with its key window records when they were sent. False when
+    /// the last activation went to another process, or none was posted.
+    public func reassertSyntheticActivation(pid: pid_t) -> Bool {
+        activationLock.lock()
+        let last = lastActivation
+        activationLock.unlock()
+        guard let last, last.pid == pid, postActivationRecord(pid: pid, windowId: last.windowId) else { return false }
+        if last.madeKey {
+            _ = postKeyWindowRecords(pid: pid, windowId: last.windowId)
+        }
+        return true
+    }
+
+    /// Posts the synthetic activation record of `windowId` to `pid`, under
+    /// the window server lock (`WindowServer.calls`). The record goes to the
+    /// target app's process only: the app then acts as the active app, while
+    /// the window server leaves the frontmost app and the window order as
+    /// they are. A click or
+    /// drag posts it before its mouse events, and a key press, `type_text`,
+    /// or `paste_text` before its key window records, so the app handles the
+    /// input as it would from the user.
+    private func postActivationRecord(pid: pid_t, windowId: Int) -> Bool {
+        guard windowId > 0, let getPSNFn, let postRecordFn else { return false }
         var buf = [UInt8](repeating: 0, count: 0xF8)
         buf[0x04] = 0xF8
         buf[0x08] = 0x0D
@@ -112,11 +151,403 @@ public final class InputDriver {
             buf[0x3C + i] = UInt8((w >> (8 * UInt32(i))) & 0xFF)
         }
         buf[0x8A] = 0x01
-        _ = buf.withUnsafeBufferPointer { b in
-            withUnsafePointer(to: &psn) { psnPtr in
-                postRecordFn(psnPtr, b.baseAddress!)
+        return WindowServer.calls.run {
+            var psn = ProcessSerialNumber()
+            guard getPSNFn(pid, &psn) == 0 else { return false }
+            _ = buf.withUnsafeBufferPointer { b in
+                withUnsafePointer(to: &psn) { psnPtr in
+                    postRecordFn(psnPtr, b.baseAddress!)
+                }
+            }
+            return true
+        }
+    }
+
+    /// The two event records that make a window the key window of its app,
+    /// posted in order to the app's process. The record `focusWithoutRaise`
+    /// posts only activates the process: the app then has no key window, so a
+    /// key equivalent that acts on the key window (Close Window, Save) finds
+    /// nothing to act on and does nothing, while one that needs no window (New
+    /// Window) works. After these records the app takes `windowId` as its key
+    /// window, without raising it. Key presses, `type_text`, and `paste_text`
+    /// post them before the first key, and a focus correction posts them to
+    /// the user's window to give its keys back.
+    static func keyWindowRecords(windowId: Int) -> [[UInt8]] {
+        let id = UInt32(truncatingIfNeeded: windowId)
+        return [UInt8(1), UInt8(2)].map { step in
+            var record = [UInt8](repeating: 0, count: 0xF8)
+            record[0x04] = 0xF8
+            record[0x08] = step
+            record[0x3A] = 0x10
+            for offset in 0x20..<0x30 {
+                record[offset] = 0xFF
+            }
+            for i in 0..<4 {
+                record[0x3C + i] = UInt8((id >> (8 * UInt32(i))) & 0xFF)
+            }
+            return record
+        }
+    }
+
+    /// Makes the app's window the key window without raising it or bringing
+    /// the app to the front, for keys that act on the key window.
+    private func makeKeyWindow(pid: pid_t, windowId: Int) {
+        guard postKeyWindowRecords(pid: pid, windowId: windowId) else { return }
+        remember(SyntheticActivation(pid: pid, windowId: windowId, madeKey: true))
+    }
+
+    /// Posts the key window records of `windowId` to `pid`. A focus correction
+    /// also posts them to the user's window to give its key focus back. False
+    /// when the calls are missing or the process has no serial number. Both
+    /// records go under one take of the window server lock
+    /// (`WindowServer.calls`), so no other window server call of the helper
+    /// comes between them.
+    func postKeyWindowRecords(pid: pid_t, windowId: Int) -> Bool {
+        guard windowId > 0, let getPSNFn, let postRecordFn else { return false }
+        let records = Self.keyWindowRecords(windowId: windowId)
+        return WindowServer.calls.run {
+            var psn = ProcessSerialNumber()
+            guard getPSNFn(pid, &psn) == 0 else { return false }
+            for record in records {
+                _ = record.withUnsafeBufferPointer { buffer in
+                    withUnsafePointer(to: &psn) { postRecordFn($0, buffer.baseAddress!) }
+                }
+            }
+            return true
+        }
+    }
+
+    /// The window the plugin named for this command, or nil to use the helper's
+    /// own choice (the window of the agent's last read).
+    static func requestedWindowId(_ params: [String: Any]) -> Int? {
+        (params["windowId"] as? NSNumber)?.intValue
+    }
+
+    /// How long to wait for the app to report the target as its focused
+    /// window after the key window records were posted. The records take
+    /// effect asynchronously, and an app that has just lost the front (the
+    /// restore gave it back to the user's app) may still be handling that
+    /// when the first records arrive, so the key window records are posted
+    /// again on each later try.
+    private static let keyWindowSettleMicros: UInt32 = 20_000
+    private static let keyWindowSettleTries = 15
+    /// The time limit of the whole key window step. Each accessibility
+    /// request can block for `AXEngine.messagingTimeoutSeconds`, and one try
+    /// makes several, so a hung app would otherwise hold the command (and the
+    /// computer) for many seconds.
+    static let keyWindowCheckLimitSeconds: Double = 1.5
+
+    /// Thrown by a time limit checkpoint when the deadline has passed.
+    struct TimeLimitReached: Error {}
+
+    /// The checkpoint a bounded accessibility step runs before each request:
+    /// it throws when the command was cancelled or the deadline (on the
+    /// `now` clock) has passed.
+    static func timeLimitCheckpoint(now: @escaping () -> Double, deadline: Double) -> () throws -> Void {
+        {
+            try CommandCancellation.checkCurrent()
+            if now() >= deadline { throw TimeLimitReached() }
+        }
+    }
+
+    private static func uptime() -> Double { ProcessInfo.processInfo.systemUptime }
+
+    /// The one prelude of every keyboard action (press_key, type_text, and
+    /// paste_text, with the paste type_text uses for an input method): the
+    /// app's target window becomes its key window without being raised, and the
+    /// app must report that window as focused before a key is sent. Returns
+    /// nil when it does, else the last check, which says why not. The caller
+    /// then sends nothing, because a key would act on whichever other window
+    /// the app has as key. An app that does not report its focused window at
+    /// all is trusted when the target is its only window. An app with no window
+    /// (`windowId` 0) has nothing to focus.
+    private func focusKeyWindow(pid: pid_t, windowId: Int) throws -> AXEngine.KeyWindowCheck? {
+        guard windowId > 0 else { return nil }
+        return try Self.settleKeyWindow(
+            post: { [self] attempt in
+                if attempt == 0 { focusWithoutRaise(pid: pid, windowId: windowId) }
+                makeKeyWindow(pid: pid, windowId: windowId)
+            },
+            check: { checkpoint in try AXEngine.shared.keyWindowCheck(pid: pid, target: windowId, checkpoint: checkpoint) },
+            sleep: { try CommandCancellation.sleepCurrent(micros: Self.keyWindowSettleMicros) },
+            tries: Self.keyWindowSettleTries,
+            now: Self.uptime,
+            limit: Self.keyWindowCheckLimitSeconds
+        )
+    }
+
+    /// Posts the key window records and polls the check until keys may be
+    /// sent; `post` gets the try number, so the records can be sent again.
+    /// Returns nil when keys may be sent, else the last check. `check` gets
+    /// the checkpoint to run before each accessibility request: a cancel
+    /// throws from it, and once `limit` seconds have passed since the start
+    /// the step ends with a `.noAnswer` refusal, even in the middle of a try.
+    /// The seam has no accessibility or window server call of its own, so
+    /// tests drive it with fakes.
+    static func settleKeyWindow(
+        post: (_ attempt: Int) -> Void,
+        check: (_ checkpoint: () throws -> Void) throws -> AXEngine.KeyWindowCheck,
+        sleep: () throws -> Void,
+        tries: Int,
+        now: @escaping () -> Double,
+        limit: Double
+    ) throws -> AXEngine.KeyWindowCheck? {
+        let checkpoint = timeLimitCheckpoint(now: now, deadline: now() + limit)
+        var last = AXEngine.KeyWindowCheck(state: .elsewhere, targetIsOnlyWindow: false)
+        for attempt in 0..<max(1, tries) {
+            post(attempt)
+            do {
+                last = try check(checkpoint)
+            } catch is TimeLimitReached {
+                return AXEngine.KeyWindowCheck(state: .noAnswer, targetIsOnlyWindow: false)
+            }
+            if last.allowsKeys { return nil }
+            if attempt < tries - 1 { try sleep() }
+        }
+        return last
+    }
+
+    /// What `unverified` says when the named element did not take the focus.
+    /// The plugin adds the element index; the helper never sees indices.
+    public static let couldNotFocusElementReason = "could not focus element"
+
+    private func couldNotFocusElement() -> [String: Any] {
+        makeActionResult(verification: ActionVerification.unverified(Self.couldNotFocusElementReason))
+    }
+
+    /// How long to wait for the app to report the named element as focused.
+    private static let elementFocusSettleMicros: UInt32 = 20_000
+    private static let elementFocusSettleTries = 8
+
+    /// True when `focused` is `target` or sits inside it. Focus may land on a
+    /// child of the element that was asked (a group that hands it to its text
+    /// field), but never on a sibling or an unrelated element.
+    static func focusIsWithin<E>(
+        focused: E?,
+        target: E,
+        parent: (E) -> E?,
+        same: (E, E) -> Bool,
+        maxDepth: Int = 24
+    ) -> Bool {
+        var node = focused
+        for _ in 0..<maxDepth {
+            guard let current = node else { return false }
+            if same(current, target) { return true }
+            node = parent(current)
+        }
+        return false
+    }
+
+    /// Asks the app to focus `element` and waits until the app reports that
+    /// element, or one inside it, as its focused element. A refused request
+    /// still passes when the element already has the focus.
+    private func focusNamedElement(_ element: AXUIElement, pid: pid_t) throws -> Bool {
+        _ = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        for attempt in 0..<Self.elementFocusSettleTries {
+            let held = Self.focusIsWithin(
+                focused: AXEngine.focusedElement(pid: pid),
+                target: element,
+                parent: { node in
+                    var ref: CFTypeRef?
+                    guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &ref) == .success,
+                          let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+                    return unsafeBitCast(ref, to: AXUIElement.self)
+                },
+                same: { CFEqual($0, $1) }
+            )
+            if held { return true }
+            if attempt < Self.elementFocusSettleTries - 1 {
+                try CommandCancellation.sleepCurrent(micros: Self.elementFocusSettleMicros)
             }
         }
+        return false
+    }
+
+    /// What the refusal says besides the window: which window the app reports
+    /// as focused, or that it reports none, so a live run shows which of the
+    /// two the app did, and what the agent can do instead: keys cannot reach
+    /// that window while the app keeps another one as key.
+    static func couldNotFocusReason(windowId: Int, check: AXEngine.KeyWindowCheck) -> String {
+        let base = "could not focus window [\(windowId)]"
+        let detail: String
+        switch check.state {
+        case .elsewhere:
+            if let reported = check.focusedWindowId {
+                detail = " (the app reports [\(reported)] as focused)"
+            } else {
+                detail = " (the app reports another window as focused)"
+            }
+        case .unreported:
+            detail = " (the app reports no focused window)"
+        case .noAnswer:
+            detail = " (the app did not answer in time)"
+        case .belongs:
+            detail = ""
+        }
+        return base + detail + ". " + couldNotFocusAlternatives
+    }
+
+    static let couldNotFocusAlternatives =
+        "No keys were sent. To act in that window, use click, secondary_action, or set_value on its elements, or ask the user."
+
+    /// Command+w with no other modifier: the chord that closes the key window.
+    static func isCloseWindowChord(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
+        keyCode == CGKeyCode(kVK_ANSI_W)
+            && flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl]) == .maskCommand
+    }
+
+    /// What the app said to an AXPress.
+    enum PressResult: Equatable {
+        case accepted
+        /// The request timed out (`.cannotComplete`): the app may still act
+        /// on it, so the button counts as pressed.
+        case timedOut
+        case refused
+
+        init(_ error: AXError) {
+            switch error {
+            case .success: self = .accepted
+            case .cannotComplete: self = .timedOut
+            default: self = .refused
+            }
+        }
+    }
+
+    /// What pressing a close button came to.
+    enum CloseButtonOutcome: Equatable {
+        /// No close button, a disabled one, or the app refused the press.
+        case unavailable
+        /// The window or tab is gone.
+        case closed
+        /// The press was accepted and the window or tab is still there (the
+        /// app may ask to save first).
+        case stillOpen
+        /// The press timed out and the window or tab was not seen gone.
+        case unknown
+    }
+
+    /// Presses the close button and waits, bounded, until `gone` says the
+    /// window or tab went away, so the read after the action sees it gone. A
+    /// press that timed out is waited for only when `waitsAfterTimeout`: the
+    /// window check asks the window server, while the tab check asks the app,
+    /// which is not answering. The seam has no accessibility or window server
+    /// call of its own, so tests drive it with fakes.
+    static func closeWithButton<Button>(
+        button: () -> Button?,
+        isEnabled: (Button) -> Bool,
+        press: (Button) -> PressResult,
+        gone: () -> Bool,
+        waitsAfterTimeout: Bool,
+        sleep: () throws -> Void,
+        tries: Int
+    ) throws -> CloseButtonOutcome {
+        guard let found = button(), isEnabled(found) else { return .unavailable }
+        let pressed = press(found)
+        switch pressed {
+        case .refused: return .unavailable
+        case .timedOut where !waitsAfterTimeout: return .unknown
+        case .accepted, .timedOut: break
+        }
+        for attempt in 0..<max(1, tries) {
+            if gone() { return .closed }
+            if attempt < tries - 1 { try sleep() }
+        }
+        return pressed == .accepted ? .stillOpen : .unknown
+    }
+
+    /// What `unverified` says when Command+w closed the window with its
+    /// close button. The plugin (`CLOSED_WITH_CLOSE_BUTTON_REASON` in
+    /// tools.ts) matches this string; keep both the same.
+    public static let closedWithCloseButtonReason = "closed with its close button"
+
+    /// The plugin (`CLOSE_BUTTON_LEFT_OPEN_REASON` in tools.ts) matches this
+    /// string to report a window that closed after the wait; keep both the
+    /// same.
+    static func closeButtonLeftWindowOpenReason(windowId: Int) -> String {
+        "pressed the close button of window [\(windowId)]; the window is still open"
+    }
+
+    static func closedTabReason(windowId: Int) -> String {
+        "closed the selected tab of window [\(windowId)] with its close button"
+    }
+
+    static func closeButtonLeftTabOpenReason(windowId: Int) -> String {
+        "pressed the close button of the selected tab of window [\(windowId)]; the tab is still open"
+    }
+
+    /// The press timed out: the app may still close the window or the tab.
+    static let closeButtonPressedStateUnknownReason = "close button pressed, window state unknown"
+
+    private static let closeSettleMicros: UInt32 = 20_000
+    private static let closeSettleTries = 25
+    /// The time limit for finding the close button, which may read the
+    /// window's tab bar.
+    private static let closeControlLimitSeconds: Double = 1.5
+
+    /// Command+w for a window that cannot be made key (an app that is not in
+    /// front keeps another window as key). The close button that closes what
+    /// Command+w would close is pressed with AXPress: the window's own, or,
+    /// in a window with more than one tab, the selected tab's (see
+    /// `CloseControl`). No event is posted and no app is activated. Returns
+    /// nil when there is no such enabled button, or the app refused the
+    /// press, so the caller refuses as for any other chord.
+    private func closeWindowWithButton(pid: pid_t, windowId: Int) throws -> [String: Any]? {
+        try CommandCancellation.checkCurrent()
+        let checkpoint = Self.timeLimitCheckpoint(now: Self.uptime, deadline: Self.uptime() + Self.closeControlLimitSeconds)
+        let target: AXEngine.CommandWButton
+        do {
+            target = try AXEngine.shared.commandWButton(pid: pid, windowId: windowId, checkpoint: checkpoint)
+        } catch is TimeLimitReached {
+            return nil
+        }
+        let press: (AXUIElement) -> PressResult = { PressResult(AXUIElementPerformAction($0, kAXPressAction as CFString)) }
+        let isEnabled: (AXUIElement) -> Bool = { AXEngine.copyBoolAttribute($0, kAXEnabledAttribute) == true }
+        let sleep = { try CommandCancellation.sleepCurrent(micros: Self.closeSettleMicros) }
+        let reason: String
+        switch target {
+        case .none:
+            return nil
+        case .window(let button):
+            let outcome = try Self.closeWithButton(
+                button: { button },
+                isEnabled: isEnabled,
+                press: press,
+                gone: { AXEngine.onScreenBounds(windowId: windowId, ownerPid: pid) == nil },
+                waitsAfterTimeout: true,
+                sleep: sleep,
+                tries: Self.closeSettleTries
+            )
+            switch outcome {
+            case .unavailable: return nil
+            case .closed: reason = Self.closedWithCloseButtonReason
+            case .stillOpen: reason = Self.closeButtonLeftWindowOpenReason(windowId: windowId)
+            case .unknown: reason = Self.closeButtonPressedStateUnknownReason
+            }
+        case .tab(let button):
+            // The button goes away with its tab. Each read asks the app, so
+            // the reads stop at the deadline and the tab then counts as open.
+            let deadline = Self.uptime() + Self.closeControlLimitSeconds
+            let outcome = try Self.closeWithButton(
+                button: { button },
+                isEnabled: isEnabled,
+                press: press,
+                gone: { Self.uptime() < deadline && AXEngine.isGone(button) },
+                waitsAfterTimeout: false,
+                sleep: sleep,
+                tries: Self.closeSettleTries
+            )
+            switch outcome {
+            case .unavailable: return nil
+            case .closed: reason = Self.closedTabReason(windowId: windowId)
+            case .stillOpen: reason = Self.closeButtonLeftTabOpenReason(windowId: windowId)
+            case .unknown: reason = Self.closeButtonPressedStateUnknownReason
+            }
+        }
+        return makeActionResult(verification: ActionVerification.unverified(reason))
+    }
+
+    private func couldNotFocus(windowId: Int, check: AXEngine.KeyWindowCheck) -> [String: Any] {
+        makeActionResult(verification: ActionVerification.unverified(Self.couldNotFocusReason(windowId: windowId, check: check)))
     }
 
     private func applyWindowTargeting(
@@ -127,15 +558,12 @@ public final class InputDriver {
         event.setIntegerValueField(.eventSourceUserData, value: kPaseoSyntheticEventUserData)
         if windowId > 0 {
             let wid64 = Int64(windowId)
-            if let f51 = CGEventField(rawValue: 51) {
-                event.setIntegerValueField(f51, value: wid64)
+            // The event's own window number. The SDK does not name this field.
+            if let eventWindowNumber = CGEventField(rawValue: 51) {
+                event.setIntegerValueField(eventWindowNumber, value: wid64)
             }
-            if let f91 = CGEventField(rawValue: 91) {
-                event.setIntegerValueField(f91, value: wid64)
-            }
-            if let f92 = CGEventField(rawValue: 92) {
-                event.setIntegerValueField(f92, value: wid64)
-            }
+            event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: wid64)
+            event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: wid64)
             setWindowLocationFn?(event, localPoint)
         }
     }
@@ -179,6 +607,41 @@ public final class InputDriver {
     /// 8 ms keystroke pace, well inside the 5 s watchdog.
     static let typingKeepAliveInterval = 64
 
+    /// Typing stops when the app reports another window as focused. An app
+    /// that reports nothing, or does not answer in time, cannot show a
+    /// change, so it is not stopped.
+    static func typingMustStop(_ check: AXEngine.KeyWindowCheck) -> Bool {
+        check.state == .elsewhere
+    }
+
+    /// The key window check made during a long `type_text`, under the same
+    /// time limit as the key window step.
+    private func midTypingKeyWindowCheck(pid: pid_t, windowId: Int) throws -> AXEngine.KeyWindowCheck {
+        let checkpoint = Self.timeLimitCheckpoint(now: Self.uptime, deadline: Self.uptime() + Self.keyWindowCheckLimitSeconds)
+        do {
+            return try AXEngine.shared.keyWindowCheck(pid: pid, target: windowId, checkpoint: checkpoint)
+        } catch is TimeLimitReached {
+            return AXEngine.KeyWindowCheck(state: .noAnswer, targetIsOnlyWindow: false)
+        }
+    }
+
+    /// The error when the app's focus moved to another window during a long
+    /// `type_text`. The user is most likely using the app, so it is a
+    /// `user_active` refusal: the agent waits, reads the app again, and types
+    /// the rest, and its turn goes on.
+    static func typingStoppedError(appName: String, text: String, typedUTF16Units: Int) -> HelperError {
+        let typed = typedCharacterCount(text, utf16Units: typedUTF16Units)
+        return HelperError(
+            code: HelperError.userActive,
+            message: "\(appName) moved its focus to another window while typing. Typed \(typed) of \(text.count) characters; the rest was not sent. The user may be using \(appName): wait a few seconds, call get_app_state again, then type the rest."
+        )
+    }
+
+    /// How many characters the first `utf16Units` UTF-16 units of `text` make.
+    static func typedCharacterCount(_ text: String, utf16Units: Int) -> Int {
+        String(decoding: Array(text.utf16.prefix(utf16Units)), as: UTF16.self).count
+    }
+
     public func performClick(params: [String: Any]) throws -> [String: Any] {
         // The name of the agent, shown next to the virtual pointer.
         let overlayLabel = params["overlayLabel"] as? String
@@ -191,7 +654,13 @@ public final class InputDriver {
         let flags = try Self.eventFlags(for: holdKeys)
         let durationSeconds = (params["duration"] as? Double) ?? 0.04
 
-        let target = try nativeId.map { try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"]) }
+        let requestedWindow = Self.requestedWindowId(params)
+        if let requestedWindow {
+            _ = try AXEngine.shared.currentWindow(pid: pid, requested: requestedWindow)
+        }
+        let target = try nativeId.map {
+            try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"], windowId: requestedWindow)
+        }
 
         // A plain left click on a named element uses AXPress first: its
         // success is the only click outcome the helper can actually confirm.
@@ -201,7 +670,7 @@ public final class InputDriver {
            holdKeys.isEmpty {
             if let frame = target.frame {
                 // The halo outlines the window that holds the element.
-                let window = (try? AXEngine.shared.currentWindow(pid: pid))?.bounds
+                let window = (try? AXEngine.shared.currentWindow(pid: pid, requested: requestedWindow))?.bounds
                 runOnMainAsync {
                     OverlayPresenter.shared.pointerMove(to: frame.center, window: window, label: overlayLabel)
                     OverlayPresenter.shared.pulse()
@@ -215,7 +684,7 @@ public final class InputDriver {
             }
         }
 
-        let (windowId, windowBounds) = try AXEngine.shared.currentWindow(pid: pid)
+        let (windowId, windowBounds) = try AXEngine.shared.currentWindow(pid: pid, requested: requestedWindow)
 
         let globalPoint: CGPoint
         if let x = (params["x"] as? NSNumber)?.doubleValue,
@@ -298,7 +767,7 @@ public final class InputDriver {
         let pid = app.processIdentifier
         let holdKeys = (params["holdKeys"] as? [String]) ?? []
         let flags = try Self.eventFlags(for: holdKeys)
-        let (windowId, windowBounds) = try AXEngine.shared.currentWindow(pid: pid)
+        let (windowId, windowBounds) = try AXEngine.shared.currentWindow(pid: pid, requested: Self.requestedWindowId(params))
 
         let startGlobal = CGPoint(x: windowBounds.origin.x + fromX, y: windowBounds.origin.y + fromY)
         let endGlobal = CGPoint(x: windowBounds.origin.x + toX, y: windowBounds.origin.y + toY)
@@ -390,8 +859,11 @@ public final class InputDriver {
         let pages = (params["pages"] as? NSNumber)?.doubleValue ?? 1.0
         let nativeId = params["nativeId"] as? String
 
-        let target = try nativeId.map { try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"]) }
-        let (windowId, windowBounds) = try AXEngine.shared.currentWindow(pid: pid)
+        let requestedWindow = Self.requestedWindowId(params)
+        let (windowId, windowBounds) = try AXEngine.shared.currentWindow(pid: pid, requested: requestedWindow)
+        let target = try nativeId.map {
+            try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"], windowId: requestedWindow)
+        }
 
         let globalPoint: CGPoint
         if let x = (params["x"] as? NSNumber)?.doubleValue,
@@ -452,7 +924,14 @@ public final class InputDriver {
         let (keyCode, flags) = try Self.parseKeyChord(keySpec)
         Self.keepOverlayAlive()
         defer { Self.keepOverlayAlive() }
-        focusWithoutRaise(pid: pid, windowId: AXEngine.shared.focusWindowId(pid: pid))
+        let keyWindowId = try AXEngine.shared.focusWindowId(pid: pid, requested: Self.requestedWindowId(params))
+        if let refused = try focusKeyWindow(pid: pid, windowId: keyWindowId) {
+            if Self.isCloseWindowChord(keyCode: keyCode, flags: flags),
+               let closed = try closeWindowWithButton(pid: pid, windowId: keyWindowId) {
+                return closed
+            }
+            return couldNotFocus(windowId: keyWindowId, check: refused)
+        }
 
         let durationSeconds = (params["duration"] as? Double) ?? 0.02
         let src = Self.syntheticEventSource()
@@ -505,11 +984,20 @@ public final class InputDriver {
         Self.keepOverlayAlive()
         defer { Self.keepOverlayAlive() }
 
-        let target = try nativeId.map { try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"]) }
-        if let target {
-            AXUIElementSetAttributeValue(target.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        let requestedWindow = Self.requestedWindowId(params)
+        let keyWindowId = try AXEngine.shared.focusWindowId(pid: pid, requested: requestedWindow)
+        let target = try nativeId.map {
+            try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"], windowId: requestedWindow)
         }
-        focusWithoutRaise(pid: pid, windowId: AXEngine.shared.focusWindowId(pid: pid))
+        if let refused = try focusKeyWindow(pid: pid, windowId: keyWindowId) {
+            return couldNotFocus(windowId: keyWindowId, check: refused)
+        }
+        // After the window check, so a refused command changes nothing in the app.
+        // Keys go to the app's focused element, so nothing is sent unless the
+        // named element (or one inside it) really has the focus.
+        if let target, try !focusNamedElement(target.element, pid: pid) {
+            return couldNotFocusElement()
+        }
         let field = target?.element ?? AXEngine.focusedElement(pid: pid)
         let before = field.flatMap { AXEngine.copyValueString($0) }
 
@@ -542,6 +1030,15 @@ public final class InputDriver {
             try CommandCancellation.checkCurrent()
             if index > 0, index % Self.typingKeepAliveInterval == 0 {
                 Self.keepOverlayAlive()
+                // The user may click another window of the same app while the
+                // text goes in; the frontmost app does not change then.
+                if keyWindowId > 0, Self.typingMustStop(try midTypingKeyWindowCheck(pid: pid, windowId: keyWindowId)) {
+                    throw Self.typingStoppedError(
+                        appName: app.localizedName ?? app.bundleIdentifier ?? "the app",
+                        text: text,
+                        typedUTF16Units: index
+                    )
+                }
             }
             var ch = scalar
             for keyDown in [true, false] {
@@ -585,8 +1082,21 @@ public final class InputDriver {
         }
         let app = try AXEngine.shared.resolveApplication(params: params)
         let pid = app.processIdentifier
-        focusWithoutRaise(pid: pid, windowId: AXEngine.shared.focusWindowId(pid: pid))
-        let field = AXEngine.focusedElement(pid: pid)
+        let requestedWindow = Self.requestedWindowId(params)
+        let keyWindowId = try AXEngine.shared.focusWindowId(pid: pid, requested: requestedWindow)
+        let target = try (params["nativeId"] as? String).map {
+            try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: $0, expected: params["expected"], windowId: requestedWindow)
+        }
+        if let refused = try focusKeyWindow(pid: pid, windowId: keyWindowId) {
+            return couldNotFocus(windowId: keyWindowId, check: refused)
+        }
+        // After the window check, so a refused command changes nothing in the app.
+        // Keys go to the app's focused element, so nothing is sent unless the
+        // named element (or one inside it) really has the focus.
+        if let target, try !focusNamedElement(target.element, pid: pid) {
+            return couldNotFocusElement()
+        }
+        let field = target?.element ?? AXEngine.focusedElement(pid: pid)
         let before = field.flatMap { AXEngine.copyValueString($0) }
 
         try pasteThroughClipboard(text: text, html: format == "html", pid: pid, field: field, before: before)
@@ -762,9 +1272,20 @@ public final class InputDriver {
         ))
     }
 
+    /// Accessibility actions that put a window in front of the user's work.
+    static func raisesWindow(_ action: String) -> Bool {
+        action == kAXRaiseAction as String
+    }
+
     public func performSecondaryAction(params: [String: Any]) throws -> [String: Any] {
         guard let action = params["action"] as? String, !action.isEmpty else {
             throw HelperError(code: HelperError.malformedRequest, message: "Missing 'action' parameter.")
+        }
+        if Self.raisesWindow(action) {
+            throw HelperError(
+                code: HelperError.malformedRequest,
+                message: "\(action) raises the window and brings the app to the front, which Computer Use never does to the user's screen."
+            )
         }
         let app = try AXEngine.shared.resolveApplication(params: params)
         let pid = app.processIdentifier
@@ -783,13 +1304,22 @@ public final class InputDriver {
     }
 
     private func resolveRequiredElement(pid: pid_t, params: [String: Any]) throws -> AXUIElement {
+        let requestedWindow = Self.requestedWindowId(params)
+        if let requestedWindow {
+            _ = try AXEngine.shared.currentWindow(pid: pid, requested: requestedWindow)
+        }
         guard let nativeId = params["nativeId"] as? String, !nativeId.isEmpty else {
             throw HelperError(
                 code: HelperError.malformedRequest,
                 message: "Missing 'nativeId'; call get_app_state first."
             )
         }
-        return try AXEngine.shared.resolveLiveElement(pid: pid, nativeId: nativeId, expected: params["expected"]).element
+        return try AXEngine.shared.resolveLiveElement(
+            pid: pid,
+            nativeId: nativeId,
+            expected: params["expected"],
+            windowId: requestedWindow
+        ).element
     }
 
     private func readBackTextEntry(field: AXUIElement?, before: String?, entered: String) throws -> [String: Any] {

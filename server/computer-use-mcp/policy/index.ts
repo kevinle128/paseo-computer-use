@@ -1,14 +1,17 @@
 import {
   ComputerUseError,
   ComputerUseToolError,
+  toToolErrorCode,
 } from "../contract/errors";
 import { AbortMonitor } from "./abort";
-import { AuditLog } from "./audit";
-import { assertAppNotBlocked } from "./deny-list";
+import { type AuditDetail, AuditLog, type AuditRefusal } from "./audit";
+import { assertBrowserAllowed } from "./browsers";
+import { assertAppNotBlocked, blockedBundleIds } from "./deny-list";
 import { ControlLock } from "./lock";
 
 export * from "./abort";
 export * from "./audit";
+export * from "./browsers";
 export * from "./deny-list";
 export * from "./lock";
 
@@ -21,8 +24,14 @@ export interface PolicyExecutionContext {
   // armed. Read tools take neither.
   mutating: boolean;
   app?: string;
+  // list_apps and list_windows name an app only to filter the list, so a
+  // browser is listed even while browsers are refused.
+  listing?: boolean;
   displayName?: string;
   textLength?: number;
+  // The action fills this in when it learns something the audit entry must
+  // keep, such as the frontmost app changing. Read when the entry is written.
+  auditDetail?: AuditDetail;
 }
 
 export interface PolicyEngineConfig {
@@ -33,6 +42,9 @@ export interface PolicyEngineConfig {
   // Read on every call so turning the setting off stops agents that were
   // created while it was on.
   isEnabled?: () => boolean;
+  // Whether web browsers may be read and controlled. Read on every call, like
+  // isEnabled.
+  allowBrowserApps: () => boolean;
 }
 
 export async function withComputerUsePolicy<TInput extends { app?: string }, TResult>(
@@ -43,7 +55,8 @@ export async function withComputerUsePolicy<TInput extends { app?: string }, TRe
 ): Promise<TResult> {
   const startMs = performance.now();
   const app = (input?.app ?? context.app)?.trim();
-  let status: "completed" | "cancelled" | "failed" = "completed";
+  let status: "completed" | "cancelled" | "failed" | "refused" = "completed";
+  let refusal: AuditRefusal | undefined;
 
   if (engine.isEnabled && !engine.isEnabled()) {
     throw new ComputerUseToolError(
@@ -55,7 +68,14 @@ export async function withComputerUsePolicy<TInput extends { app?: string }, TRe
   engine.abortMonitor.assertNotAborted(context.callerId);
 
   if (app) {
-    assertAppNotBlocked(app, engine.getExtraBlockedBundleIds?.());
+    const extraBlocked = [...(engine.getExtraBlockedBundleIds?.() ?? [])];
+    assertAppNotBlocked(app, extraBlocked);
+    if (!context.listing) {
+      assertBrowserAllowed(app, {
+        allowBrowserApps: engine.allowBrowserApps(),
+        deniedBundleIds: blockedBundleIds(extraBlocked),
+      });
+    }
   }
 
   if (context.mutating) {
@@ -104,7 +124,13 @@ export async function withComputerUsePolicy<TInput extends { app?: string }, TRe
     ) {
       status = "cancelled";
     } else {
-      status = "failed";
+      const code = toToolErrorCode(error);
+      if (code === "user_active" || code === "stale_state") {
+        status = "refused";
+        refusal = code;
+      } else {
+        status = "failed";
+      }
     }
     throw error;
   } finally {
@@ -115,6 +141,16 @@ export async function withComputerUsePolicy<TInput extends { app?: string }, TRe
       status,
       durationMs: performance.now() - startMs,
       textLength: context.textLength,
+      ...(context.auditDetail?.userFocusChanged !== undefined
+        ? { userFocusChanged: context.auditDetail.userFocusChanged }
+        : {}),
+      ...(context.auditDetail?.focusWatchDetail !== undefined
+        ? { focusWatchDetail: context.auditDetail.focusWatchDetail }
+        : {}),
+      ...(refusal !== undefined ? { refusal } : {}),
+      ...(context.auditDetail?.userActivityDetail !== undefined
+        ? { userActivityDetail: context.auditDetail.userActivityDetail }
+        : {}),
     });
   }
 }

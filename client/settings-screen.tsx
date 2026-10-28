@@ -38,10 +38,12 @@ const BUILTIN_BLOCK_HINT =
   "1Password, Bitwarden, Dashlane, LastPass, NordPass, and Proton Pass apps are always " +
   "blocked. Add more bundle ids here, separated by commas or new lines.";
 
+const BROWSER_HINT = "Off: agents use Paseo's browser tools for the web.";
+
 const screenshotOptions = [
-  { label: "Auto (AX first, screenshot on request)", value: "auto" },
+  { label: "Auto (AX first; screenshot on request or for a sparse tree)", value: "auto" },
   { label: "Always include screenshot", value: "always" },
-  { label: "AX tree only (never screenshot)", value: "never" },
+  { label: "AX tree only (no screenshot sent to the agent)", value: "never" },
 ] as const;
 
 type ReadySettings = Extract<
@@ -128,6 +130,13 @@ function SettingsControls({
     [settings],
   );
 
+  const onToggleBrowserApps = useCallback(
+    (allowBrowserApps: boolean) => {
+      void settings.save({ ...settings.values, allowBrowserApps }, settings.revision);
+    },
+    [settings],
+  );
+
   const onChangeScreenshots = useCallback(
     (screenshots: ReadySettings["values"]["screenshots"]) => {
       void settings.save({ ...settings.values, screenshots }, settings.revision);
@@ -171,6 +180,13 @@ function SettingsControls({
           value={settings.values.enabled}
           disabled={settings.saving}
           onValueChange={onToggleEnabled}
+        />
+        <SettingsSwitch
+          label="Allow Computer Use in web browsers"
+          hint={BROWSER_HINT}
+          value={settings.values.allowBrowserApps}
+          disabled={settings.saving}
+          onValueChange={onToggleBrowserApps}
         />
         <SettingsSelect
           label="Screenshot mode"

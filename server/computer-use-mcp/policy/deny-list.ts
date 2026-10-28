@@ -68,14 +68,18 @@ export function isAppBlocked(
   return blockedBundleIds(extraBlockedBundleIds).some((id) => normalize(id) === normalized);
 }
 
+export function appBlockedError(appIdentifier: string): ComputerUseToolError {
+  return new ComputerUseToolError(
+    "app_blocked",
+    `Computer Use is not allowed to use the app '${appIdentifier}' for safety reasons.`,
+  );
+}
+
 export function assertAppNotBlocked(
   appIdentifier: string,
   extraBlockedBundleIds?: Iterable<string>,
 ): void {
   if (isAppBlocked(appIdentifier, extraBlockedBundleIds)) {
-    throw new ComputerUseToolError(
-      "app_blocked",
-      `Computer Use is not allowed to use the app '${appIdentifier}' for safety reasons.`,
-    );
+    throw appBlockedError(appIdentifier);
   }
 }

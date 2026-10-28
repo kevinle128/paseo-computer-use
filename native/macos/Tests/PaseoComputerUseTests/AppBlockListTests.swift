@@ -18,6 +18,45 @@ final class AppBlockListTests: XCTestCase {
         XCTAssertNoThrow(try list.check("com.apple.TextEdit"))
     }
 
+    /// The plugin reads the refused bundle id from this field, not from the
+    /// message text.
+    func testRefusalCarriesTheRefusedBundleId() {
+        XCTAssertThrowsError(try list.check("  com.bitwarden.desktop ")) { error in
+            let helperError = error as? HelperError
+            XCTAssertEqual(helperError?.code, HelperError.appBlocked)
+            XCTAssertEqual(helperError?.bundleId, "com.bitwarden.desktop")
+        }
+    }
+
+    func testPrefixBlocksEveryIdThatStartsWithIt() {
+        let webApps = AppBlockList(bundleIds: ["com.google.Chrome"], prefixes: [" com.google.Chrome.app. "])
+        XCTAssertTrue(webApps.blocks("com.google.Chrome.app.abcdef"))
+        XCTAssertTrue(webApps.blocks("COM.GOOGLE.CHROME.APP.ABCDEF"))
+        XCTAssertTrue(webApps.blocks("com.google.Chrome"))
+        XCTAssertFalse(webApps.blocks("com.google.Chrome.beta"))
+        XCTAssertFalse(webApps.blocks("com.google.Chrome.app"))
+        XCTAssertThrowsError(try webApps.check("com.google.Chrome.app.abcdef")) { error in
+            XCTAssertEqual((error as? HelperError)?.bundleId, "com.google.Chrome.app.abcdef")
+        }
+        XCTAssertFalse(AppBlockList(bundleIds: [], prefixes: [" "]).blocks("com.apple.TextEdit"))
+    }
+
+    func testPrefixesAreOptionalInCommandParameters() throws {
+        let withPrefixes = try AppBlockList(params: [
+            "blockedBundleIds": ["com.bitwarden.desktop"],
+            "blockedBundleIdPrefixes": ["com.apple.Safari.WebApp."],
+        ])
+        XCTAssertTrue(withPrefixes.blocks("com.apple.Safari.WebApp.0A1B2C3D"))
+        XCTAssertEqual(
+            withPrefixes,
+            AppBlockList(bundleIds: ["com.bitwarden.desktop"], prefixes: ["com.apple.Safari.WebApp."])
+        )
+        XCTAssertFalse(try AppBlockList(params: ["blockedBundleIds": []]).blocks("com.apple.Safari.WebApp.0A1B2C3D"))
+        XCTAssertThrowsError(try AppBlockList(params: ["blockedBundleIds": [], "blockedBundleIdPrefixes": "com."])) { error in
+            XCTAssertEqual((error as? HelperError)?.code, HelperError.malformedRequest)
+        }
+    }
+
     func testNotRunningBlockedBundleIdIsRefusedBeforeResolution() {
         let engine = AXEngine()
         XCTAssertThrowsError(try engine.resolveApplication("com.bitwarden.desktop", blocking: list)) { error in
@@ -40,10 +79,23 @@ final class AppBlockListTests: XCTestCase {
     /// A display name or a partial name is not on the list itself; the
     /// helper must refuse it after it resolves to a blocked bundle id.
     /// Finder is always running, so it stands in for a password manager.
-    func testNameResolvingToBlockedBundleIdIsRefused() {
+    /// The partial name must match only Finder: a name such as "finde" also
+    /// matches helper apps (Finder extensions, Quick Look), and the first
+    /// match would then be an app that is not blocked.
+    func testNameResolvingToBlockedBundleIdIsRefused() throws {
         let finderBlocked = AppBlockList(bundleIds: ["com.apple.finder"])
         let engine = AXEngine()
-        for name in ["Finder", "finde", "/System/Library/CoreServices/Finder.app"] {
+        let partialName = "apple.finder"
+        let partialMatches = NSWorkspace.shared.runningApplications.filter {
+            !$0.isTerminated &&
+                (($0.localizedName?.lowercased().contains(partialName) ?? false) ||
+                    ($0.bundleIdentifier?.lowercased().contains(partialName) ?? false))
+        }
+        try XCTSkipUnless(
+            partialMatches.map(\.bundleIdentifier) == ["com.apple.finder"],
+            "Another running app also matches '\(partialName)'."
+        )
+        for name in ["Finder", partialName, "/System/Library/CoreServices/Finder.app"] {
             XCTAssertFalse(finderBlocked.blocks(name))
             XCTAssertThrowsError(try engine.resolveApplication(name, blocking: finderBlocked)) { error in
                 XCTAssertEqual((error as? HelperError)?.code, HelperError.appBlocked, name)

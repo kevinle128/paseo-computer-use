@@ -20,6 +20,7 @@ const defaultSettings: ComputerUseSettingsValues = {
   injectProviders: ["claude", "codex", "omp"],
   extraBlockedBundleIds: [],
   screenshots: "auto",
+  allowBrowserApps: false,
 };
 
 describe("addComputerUseServer", () => {
@@ -83,6 +84,7 @@ describe("addComputerUseServer", () => {
       { kind: "mcp", server: "paseo-computer", tool: "list_apps" },
       { kind: "mcp", server: "paseo-computer", tool: "list_windows" },
       { kind: "mcp", server: "paseo-computer", tool: "get_app_state" },
+      { kind: "mcp", server: "paseo-computer", tool: "wait_for" },
     ]);
   });
 

@@ -175,6 +175,13 @@ describe("settings helpers", () => {
   it("defaults to the three supported providers", () => {
     expect(computerUseSettingsSchema.parse({}).injectProviders).toEqual(["claude", "codex", "omp"]);
   });
+
+  it("keeps web browsers off by default, also for settings saved before the switch existed", () => {
+    expect(computerUseSettingsSchema.parse({}).allowBrowserApps).toBe(false);
+    expect(
+      computerUseSettingsSchema.parse({ enabled: true, extraBlockedBundleIds: [], screenshots: "auto" }).allowBrowserApps,
+    ).toBe(false);
+  });
 });
 
 // The status RPC never reaches the helper when the build is not ready, so a

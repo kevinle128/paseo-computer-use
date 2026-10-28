@@ -13,6 +13,9 @@ export const HELPER_ERROR_CODES = [
   "aborted_by_user",
   "user_intervened",
   "stale_element",
+  "permission_missing",
+  "window_gone",
+  "user_active",
 ] as const;
 
 export type HelperErrorCode = (typeof HELPER_ERROR_CODES)[number];
@@ -21,18 +24,41 @@ export class ComputerUseError extends Error {
   readonly code: HelperErrorCode;
   readonly request?: unknown;
   readonly requestType?: string;
+  // `user_focus_changed` line of an action that changed the app in front and
+  // then failed.
+  readonly userFocusChanged?: string;
+  // The input idle times behind the watch outcome in `userFocusChanged` and
+  // the correction steps that ran, for the audit log only.
+  readonly focusWatchDetail?: string;
+  // The window a `window_gone` error is about.
+  readonly windowId?: number;
+  // The bundle id an `app_blocked` error refused.
+  readonly bundleId?: string;
+  // The rule and input idle times behind a `user_active` refusal, for the audit log
+  // only. The agent never sees them.
+  readonly userActivityDetail?: string;
 
   constructor(options: {
     code: HelperErrorCode;
     message: string;
     request?: unknown;
     requestType?: string;
+    userFocusChanged?: string;
+    focusWatchDetail?: string;
+    windowId?: number;
+    bundleId?: string;
+    userActivityDetail?: string;
   }) {
     super(options.message);
     this.name = "ComputerUseError";
     this.code = options.code;
     this.request = options.request;
     this.requestType = options.requestType;
+    this.userFocusChanged = options.userFocusChanged;
+    this.focusWatchDetail = options.focusWatchDetail;
+    this.windowId = options.windowId;
+    this.bundleId = options.bundleId;
+    this.userActivityDetail = options.userActivityDetail;
   }
 }
 
@@ -57,8 +83,12 @@ export const TOOL_ERROR_CODES = [
   "computer_busy",
   "aborted_by_user",
   "app_blocked",
+  "use_browser_tools",
   "permission_missing",
   "stale_element",
+  "window_gone",
+  "user_active",
+  "stale_state",
   "helper_unavailable",
   "invalid_arguments",
   "action_failed",
@@ -99,6 +129,21 @@ export function toToolErrorCode(
     // id, which the plugin cannot do on its own.
     if (error.code === "app_blocked") {
       return "app_blocked";
+    }
+    if (error.code === "permission_missing") {
+      return "permission_missing";
+    }
+    // The window the agent named or last read is closed. Reading again picks
+    // a window that exists; acting never falls back to another one.
+    if (error.code === "window_gone") {
+      return "window_gone";
+    }
+    // The user pressed a key, a mouse button, or scrolled in the target app a
+    // moment ago. Usually the helper refused the action before it sent
+    // anything; a long type_text that the user interrupted stops part way and
+    // reports how many characters it typed.
+    if (error.code === "user_active") {
+      return "user_active";
     }
     // Missing or malformed arguments the helper rejected, such as an unknown
     // key name.

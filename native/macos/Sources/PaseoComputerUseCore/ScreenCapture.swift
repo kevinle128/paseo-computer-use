@@ -72,15 +72,44 @@ public final class ScreenCapture {
         return result.get()
     }
 
+    /// The window image as captured, before anything is drawn on it. Nil when
+    /// Screen Recording is not granted or the window cannot be captured.
+    private func captureRawWindowImage(windowId: Int) -> CGImage? {
+        guard windowId > 0, CGPreflightScreenCaptureAccess() else {
+            return nil
+        }
+        return captureWithWindowList(windowId: windowId)
+            ?? captureWithScreenCaptureKit(windowId: windowId)
+    }
+
+    /// The signature of one window image, or of a region of it (window
+    /// points). Taken from the raw capture, so the pointer mark that
+    /// screenshots carry never counts as a change. Nil when the window cannot
+    /// be captured (a failure that may pass); a region outside the window
+    /// throws, because no later capture can fix it.
+    public func captureSignature(windowId: Int, windowBounds: CGRect, region: CGRect?) throws -> [UInt8]? {
+        guard let image = captureRawWindowImage(windowId: windowId) else {
+            return nil
+        }
+        if let region,
+           CaptureSignature.pixelRect(
+               region: region,
+               windowSize: windowBounds.size,
+               imageSize: CGSize(width: image.width, height: image.height)
+           ) == nil {
+            throw HelperError(
+                code: HelperError.malformedRequest,
+                message: "The region lies outside the window. Give x, y, width, and height in window points."
+            )
+        }
+        return CaptureSignature.bytes(of: image, region: region, windowSize: windowBounds.size)
+    }
+
     public func captureWindowScreenshot(
         windowId: Int,
         windowBounds: CGRect?
     ) -> [String: Any]? {
-        guard windowId > 0, CGPreflightScreenCaptureAccess() else {
-            return nil
-        }
-        guard let rawImage = captureWithWindowList(windowId: windowId)
-            ?? captureWithScreenCaptureKit(windowId: windowId) else {
+        guard let rawImage = captureRawWindowImage(windowId: windowId) else {
             return nil
         }
         let width = rawImage.width

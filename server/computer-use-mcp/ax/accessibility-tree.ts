@@ -1,11 +1,20 @@
 import type { RawAXBounds, RawAXNode, RawAXTree } from "../contract/results";
 import type { ElementIds, IndexedElement } from "./element-ids";
+import { otherWindowsLine } from "./windows";
 
 export interface CondenseAccessibilityTreeOptions {
   elementIds: ElementIds;
   // Canonical app identity (bundle id) that owns the numbered elements.
   app: string;
   query?: string;
+  // Print every menu of the menu bar. Off by default: a closed menu is
+  // reduced to its title and item count, because the full menu bar of a large
+  // app is several thousand lines.
+  includeMenus?: boolean;
+  // Native id of the menu bar item the action just pressed. When no menu bar
+  // item reports that it is selected and its menu is the only one with a
+  // frame, that menu is open.
+  pressedMenuBarItem?: string;
 }
 
 interface TextAttribute {
@@ -177,6 +186,7 @@ function hasMeaningfulStates(node: RawAXNode): boolean {
       "expanded",
       "indeterminate",
       "checked",
+      "mixed",
       "checkable",
       "editable",
       "settable",
@@ -214,6 +224,61 @@ function mergeBounds(nodes: RawAXNode[]): RawAXBounds | undefined {
     width: maxX - minX,
     height: maxY - minY,
   };
+}
+
+function menuItemCount(menuBarItem: RawAXNode): number {
+  const menu = (menuBarItem.children ?? []).find((child) => child.role === "AXMenu");
+  return (menu?.children ?? []).filter(
+    (item) => item.role === "AXMenuItem" && (item.name ?? "").trim() !== "",
+  ).length;
+}
+
+function isSelected(node: RawAXNode): boolean {
+  return (node.states ?? []).some((state) => state.toLowerCase() === "selected");
+}
+
+// Whether the menu under a menu bar item has a frame, which an open menu has
+// and a closed one usually does not.
+function menuHasFrame(menuBarItem: RawAXNode): boolean {
+  const menu = (menuBarItem.children ?? []).find((child) => child.role === "AXMenu");
+  return menu?.bounds !== undefined && menu.bounds.width > 0 && menu.bounds.height > 0;
+}
+
+// Closes every menu of the menu bar except the open one. When the menu bar
+// items report the selected attribute (true or false), an item is open when it
+// is selected, and nothing else counts: Chrome keeps the frame of a closed
+// menu. The one exception: no item is selected, the action in this call was a
+// press on a menu bar item, and that item's menu is the only one with a frame.
+// Some apps set the attribute late or never, and the agent would see the menu
+// it just opened collapsed. When no item reports the attribute, the frame
+// decides: one menu with a frame is open, and if every menu has a frame the
+// frames say nothing.
+function collapseClosedMenus(node: RawAXNode, pressedItem: string | undefined): RawAXNode {
+  if (node.role === "AXMenuBar") {
+    const items = node.children ?? [];
+    const reportsSelected = items.some((item) => item.selected !== undefined || isSelected(item));
+    const framed = items.filter(menuHasFrame);
+    const framedMeansOpen = framed.length === 1;
+    const anySelected = items.some((item) => isSelected(item) || item.selected === true);
+    const pressedAndFramed = (item: RawAXNode): boolean =>
+      !anySelected && framedMeansOpen && framed[0] === item && pressedItem !== undefined && item.native_id === pressedItem;
+    const isOpen = (item: RawAXNode): boolean =>
+      reportsSelected
+        ? isSelected(item) || item.selected === true || pressedAndFramed(item)
+        : framedMeansOpen && framed[0] === item;
+    return {
+      ...node,
+      children: items.map((item) => (isOpen(item) ? item : { ...item, children: [], menu_items: menuItemCount(item) })),
+    };
+  }
+  if (!node.children?.some(hasMenuBar)) {
+    return node;
+  }
+  return { ...node, children: node.children.map((child) => collapseClosedMenus(child, pressedItem)) };
+}
+
+function hasMenuBar(node: RawAXNode): boolean {
+  return node.role === "AXMenuBar" || (node.children ?? []).some(hasMenuBar);
 }
 
 function pruneNode(
@@ -383,7 +448,9 @@ function formatStates(node: RawAXNode): string {
     }
   }
 
-  if (statesLower.has("checked")) {
+  if (statesLower.has("mixed")) {
+    formatted.push("mixed");
+  } else if (statesLower.has("checked")) {
     formatted.push("checked");
   } else if (statesLower.has("checkable") && !statesLower.has("indeterminate")) {
     formatted.push("unchecked");
@@ -465,11 +532,14 @@ function formatNodeLine(
   const shortTextPart = shortAttrs.map(formatAttr).join(", ");
   const longTextPart = longAttrs.map(formatAttr).join(", ");
 
+  const menuPart = node.menu_items !== undefined ? `(menu, ${node.menu_items} items)` : "";
+
   const parts = [
     indexPart,
     displayRole,
     statesPart,
     shortTextPart,
+    menuPart,
     secondaryActionsPart,
     boundsPart,
     longTextPart,
@@ -505,7 +575,17 @@ export function condenseAccessibilityTree(
     headerLines.push(`Document Text: ${escapeSingleLine(tree.document_text)}`);
   }
 
-  const prunedRoot = tree.root ? pruneNode(tree.root, queryLower, false) : null;
+  const otherWindows = otherWindowsLine(tree);
+  if (otherWindows) {
+    headerLines.push(otherWindows);
+  }
+
+  // A query searches every menu item, so it needs the whole menu bar.
+  const menuTree =
+    tree.root && !options.includeMenus && !queryLower && hasMenuBar(tree.root)
+      ? collapseClosedMenus(tree.root, options.pressedMenuBarItem)
+      : tree.root;
+  const prunedRoot = menuTree ? pruneNode(menuTree, queryLower, false) : null;
 
   const interactiveElements: IndexedElement[] = [];
   const collectInteractiveIds = (node: RawAXNode | null) => {
@@ -554,12 +634,14 @@ export function condenseAccessibilityTree(
   return bodyLines.join("\n");
 }
 
+export const NO_CHANGES_TEXT = "No accessibility changes.";
+
 export function formatAccessibilityDiff(previousText: string, nextText: string): string {
   if (!previousText) {
     return nextText;
   }
   if (previousText === nextText) {
-    return "No accessibility changes.";
+    return NO_CHANGES_TEXT;
   }
 
   const prevLines = previousText.split("\n");
@@ -584,4 +666,112 @@ export function formatAccessibilityDiff(previousText: string, nextText: string):
     diffLines.push(`+ ${line}`);
   }
   return diffLines.join("\n");
+}
+
+// A window tree with fewer indexed elements than this is too sparse to act on
+// (canvas, game, remote desktop, some Electron views), so the state needs a
+// screenshot and coordinates instead.
+export const SPARSE_TREE_ELEMENT_LIMIT = 3;
+
+// Window-local frames differ from the window's own size by at most this many
+// points when they describe the same window.
+const WINDOW_FRAME_TOLERANCE = 2;
+
+function findWindowNode(tree: RawAXTree): RawAXNode | undefined {
+  const size = tree.window_bounds;
+  if (!size || !tree.root) {
+    return undefined;
+  }
+  const search = (node: RawAXNode, depth: number): RawAXNode | undefined => {
+    if (node.role === "AXWindow" && node.window_id !== undefined && node.window_id === tree.window_id) {
+      return node;
+    }
+    if (node.role === "AXWindow" && node.window_id === undefined && node.bounds) {
+      const { x, y, width, height } = node.bounds;
+      const sameFrame =
+        Math.abs(x) <= WINDOW_FRAME_TOLERANCE &&
+        Math.abs(y) <= WINDOW_FRAME_TOLERANCE &&
+        Math.abs(width - size.width) <= WINDOW_FRAME_TOLERANCE &&
+        Math.abs(height - size.height) <= WINDOW_FRAME_TOLERANCE;
+      if (sameFrame) {
+        return node;
+      }
+    }
+    if (depth >= 2) {
+      return undefined;
+    }
+    for (const child of node.children ?? []) {
+      const found = search(child, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  };
+  return search(tree.root, 0);
+}
+
+// Window chrome every window has, so it says nothing about the content.
+const WINDOW_CHROME_SUBROLES = new Set([
+  "AXCloseButton",
+  "AXMinimizeButton",
+  "AXZoomButton",
+  "AXFullScreenButton",
+]);
+
+function isWindowChrome(node: RawAXNode): boolean {
+  return (
+    node.role === "AXMenuBar" ||
+    node.role === "AXWebArea" ||
+    node.role === "AXWindow" ||
+    (node.subrole !== undefined && WINDOW_CHROME_SUBROLES.has(node.subrole))
+  );
+}
+
+function area(node: RawAXNode): number {
+  return node.bounds ? node.bounds.width * node.bounds.height : 0;
+}
+
+// The largest web area under the node (by area), if there is one.
+function findLargestWebArea(node: RawAXNode): RawAXNode | undefined {
+  let best: RawAXNode | undefined;
+  const visit = (current: RawAXNode) => {
+    if (current.role === "AXWebArea" && (best === undefined || area(current) > area(best))) {
+      best = current;
+    }
+    for (const child of current.children ?? []) {
+      visit(child);
+    }
+  };
+  visit(node);
+  return best;
+}
+
+// How many elements an agent can act on by index in the content of the target
+// window. A window with a web area (a browser tab, an Electron view) is
+// judged by its largest web area alone: the browser toolbar and tabs around a
+// canvas page would otherwise hide that the page has no controls. Otherwise
+// the whole window counts, without the menu bar, the window itself, and its
+// close, minimize, and zoom buttons: every app has them, so they say nothing
+// about the content.
+export function countIndexedElements(tree: RawAXTree | null | undefined): number {
+  const window = tree ? (findWindowNode(tree) ?? tree.root) : undefined;
+  const start = window ? (findLargestWebArea(window) ?? window) : undefined;
+  const pruned = start ? pruneNode(start, undefined, false) : null;
+  const nativeIds = new Set<string>();
+  const visit = (node: RawAXNode) => {
+    if (node.role === "AXMenuBar") {
+      return;
+    }
+    if (!isWindowChrome(node) && isInteractiveNode(node) && node.native_id) {
+      nativeIds.add(node.native_id);
+    }
+    for (const child of node.children ?? []) {
+      visit(child);
+    }
+  };
+  if (pruned) {
+    visit(pruned);
+  }
+  return nativeIds.size;
 }

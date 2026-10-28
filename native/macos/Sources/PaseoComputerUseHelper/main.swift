@@ -30,14 +30,39 @@ private func sendResponse(id: Int, result: Any) {
     ])
 }
 
-private func sendError(id: Int, code: String, message: String) {
+private func sendError(
+    id: Int,
+    code: String,
+    message: String,
+    userFocusChanged: String? = nil,
+    focusWatchDetail: String? = nil,
+    windowId: Int? = nil,
+    bundleId: String? = nil,
+    userActivityDetail: String? = nil
+) {
+    var error: [String: Any] = [
+        "code": code,
+        "message": message,
+    ]
+    if let userFocusChanged {
+        error["userFocusChanged"] = userFocusChanged
+    }
+    if let focusWatchDetail {
+        error["focusWatchDetail"] = focusWatchDetail
+    }
+    if let windowId {
+        error["windowId"] = windowId
+    }
+    if let bundleId {
+        error["bundleId"] = bundleId
+    }
+    if let userActivityDetail {
+        error["userActivityDetail"] = userActivityDetail
+    }
     sendJSONLine([
         "id": id,
         "ok": false,
-        "error": [
-            "code": code,
-            "message": message,
-        ],
+        "error": error,
     ])
 }
 
@@ -88,8 +113,14 @@ private let commandRegistry = CommandRegistry()
 /// hung app never blocks the user's input or the stop key.
 private let commandQueue = DispatchQueue(label: "paseo.computer-use.commands", qos: .userInitiated)
 
-private let escapeMonitor = UserInputEscapeMonitor { reason in
+private let escapeMonitor: UserInputEscapeMonitor = UserInputEscapeMonitor { reason in
     commandRegistry.cancelAll()
+    // The tap calls this on the main thread.
+    MainActor.assumeIsolated {
+        controlInputWatch.userStopped()
+    }
+    // A stop must not be followed by the plugin activating an app.
+    FrontmostGuard.shared.stopWatches()
     let message: String
     switch reason {
     case .escapeKey:
@@ -106,6 +137,10 @@ private let escapeMonitor = UserInputEscapeMonitor { reason in
         OverlayPresenter.shared.hide()
     }
 }
+
+/// The Escape stop key and the click and scroll log, which run only while an
+/// agent controls the computer.
+private let controlInputWatch: ControlInputWatch = ControlInputWatch(stopKey: escapeMonitor, inputLog: UserInputLog.shared)
 
 /// Commands that only change helper state. They run on the main thread, which
 /// owns the event tap, and never wait behind a running action.
@@ -125,14 +160,17 @@ private func dispatchControlCommand(cmd: String, params: [String: Any]) throws -
         // the overlay fades out. The Escape tap stays armed: the plugin's
         // control lock owns it and disarms it when it releases the computer.
         OverlayPresenter.shared.hide()
+        FrontmostGuard.shared.stopWatches()
         return ["ok": true]
 
     case "abort_tap.arm":
-        let armed = escapeMonitor.arm()
-        return ["armed": armed]
+        return ["armed": controlInputWatch.arm()]
 
     case "abort_tap.disarm":
-        escapeMonitor.disarm()
+        controlInputWatch.disarm()
+        // The stop key is no longer watching this session, so no restore
+        // may follow it.
+        FrontmostGuard.shared.stopWatches()
         return ["armed": false]
 
     default:
@@ -140,7 +178,19 @@ private func dispatchControlCommand(cmd: String, params: [String: Any]) throws -
     }
 }
 
-private func dispatchCommand(cmd: String, params: [String: Any]) throws -> Any {
+/// The app an action is aimed at, read once when the action starts. Nil when
+/// the command names none or it cannot be resolved; the action then reports
+/// its own error.
+private func targetPid(_ params: [String: Any]) -> pid_t? {
+    (try? AXEngine.shared.resolveApplication(params: params))?.processIdentifier
+}
+
+private func dispatchCommand(cmd: String, params: [String: Any], caller: String?) throws -> Any {
+    let isAction = UserActivity.gatedCommands.contains(cmd)
+    let target = isAction ? targetPid(params) : nil
+    // An action that would send input or change an element while the user is
+    // using its target app is refused here, before it sends anything.
+    try UserActivity.check(command: cmd, target: target)
     switch cmd {
     case "status":
         let axTrusted = AXIsProcessTrusted()
@@ -174,7 +224,9 @@ private func dispatchCommand(cmd: String, params: [String: Any]) throws -> Any {
         // numbered text, so the helper always returns the full raw tree.
         let captured = try AXEngine.shared.captureAppState(
             appIdentifier: appName,
-            blocking: try AppBlockList(params: params)
+            blocking: try AppBlockList(params: params),
+            updateCache: (params["cache"] as? Bool) ?? true,
+            windowId: (params["windowId"] as? NSNumber)?.intValue
         )
 
         var windowState: [String: Any] = [
@@ -203,35 +255,87 @@ private func dispatchCommand(cmd: String, params: [String: Any]) throws -> Any {
 
         return [
             "app": appDescriptor,
+            // Whether the app was the frontmost one when it was read.
+            "isActive": captured.app.isActive,
             "windowState": windowState,
         ]
 
+    case "capture.signature":
+        guard let appName = params["app"] as? String else {
+            throw HelperError(code: HelperError.malformedRequest, message: "Missing 'app' parameter.")
+        }
+        var region: CGRect?
+        if let box = params["region"] as? [String: Any] {
+            guard let x = (box["x"] as? NSNumber)?.doubleValue,
+                  let y = (box["y"] as? NSNumber)?.doubleValue,
+                  let width = (box["width"] as? NSNumber)?.doubleValue,
+                  let height = (box["height"] as? NSNumber)?.doubleValue,
+                  width > 0, height > 0 else {
+                throw HelperError(
+                    code: HelperError.malformedRequest,
+                    message: "'region' needs numeric x, y, width, and height, with a positive width and height."
+                )
+            }
+            region = CGRect(x: x, y: y, width: width, height: height)
+        }
+        guard CGPreflightScreenCaptureAccess() else {
+            throw HelperError(
+                code: HelperError.permissionMissing,
+                message: "The Screen Recording permission is missing, so the window image cannot be compared."
+            )
+        }
+        let target = try AXEngine.shared.captureWindow(
+            appIdentifier: appName,
+            windowId: (params["windowId"] as? NSNumber)?.intValue,
+            blocking: try AppBlockList(params: params)
+        )
+        guard let bytes = try ScreenCapture.shared.captureSignature(
+            windowId: target.windowId,
+            windowBounds: target.bounds,
+            region: region
+        ) else {
+            throw HelperError(
+                code: HelperError.accessibilityError,
+                message: "The window image could not be captured."
+            )
+        }
+        return [
+            "signature": Data(bytes).base64EncodedString(),
+            "width": CaptureSignature.width,
+            "height": CaptureSignature.height,
+            // The window that was captured and its size in points, so two
+            // signatures can be compared only when they show the same window.
+            "windowId": target.windowId,
+            "windowWidth": Double(target.bounds.width),
+            "windowHeight": Double(target.bounds.height),
+        ]
+
     case "click":
-        return try InputDriver.shared.performClick(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }) { try InputDriver.shared.performClick(params: params) }
 
     case "drag":
-        return try InputDriver.shared.performDrag(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }) { try InputDriver.shared.performDrag(params: params) }
 
     case "scroll":
-        return try InputDriver.shared.performScroll(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }) { try InputDriver.shared.performScroll(params: params) }
 
     case "press_key":
-        return try InputDriver.shared.performPressKey(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }, keyboard: true) { try InputDriver.shared.performPressKey(params: params) }
 
     case "type_text":
-        return try InputDriver.shared.performTypeText(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }, keyboard: true) { try InputDriver.shared.performTypeText(params: params) }
 
     case "paste_text":
-        return try InputDriver.shared.performPasteText(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }, keyboard: true) { try InputDriver.shared.performPasteText(params: params) }
 
     case "set_value":
-        return try InputDriver.shared.performSetValue(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }) { try InputDriver.shared.performSetValue(params: params) }
 
     case "select_text":
-        return try InputDriver.shared.performSelectText(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }) { try InputDriver.shared.performSelectText(params: params) }
 
     case "perform_secondary_action":
-        return try InputDriver.shared.performSecondaryAction(params: params)
+        return try FrontmostGuard.run(caller: caller, target: { target }) { try InputDriver.shared.performSecondaryAction(params: params) }
 
     default:
         throw HelperError(code: HelperError.unknownCommand, message: "Unknown command '\(cmd)'.")
@@ -250,7 +354,16 @@ private func reply(id: Int, _ body: () throws -> Any) {
     do {
         sendResponse(id: id, result: try body())
     } catch let err as HelperError {
-        sendError(id: id, code: err.code, message: err.message)
+        sendError(
+            id: id,
+            code: err.code,
+            message: err.message,
+            userFocusChanged: err.userFocusChanged,
+            focusWatchDetail: err.focusWatchDetail,
+            windowId: err.windowId,
+            bundleId: err.bundleId,
+            userActivityDetail: err.userActivityDetail
+        )
     } catch {
         sendError(id: id, code: HelperError.internalError, message: error.localizedDescription)
     }
@@ -273,6 +386,9 @@ let stdinThread = Thread {
             continue
         }
         let params = (json["params"] as? [String: Any]) ?? [:]
+        // The plugin names the agent the command is for, so a focus note
+        // from this command goes back to that agent.
+        let caller = (json["meta"] as? [String: Any])?["callerId"] as? String
 
         if controlCommands.contains(cmd) {
             DispatchQueue.main.async {
@@ -293,7 +409,7 @@ let stdinThread = Thread {
             reply(id: id) {
                 try token.check()
                 return try CommandCancellation.run(with: token) {
-                    try dispatchCommand(cmd: cmd, params: params)
+                    try dispatchCommand(cmd: cmd, params: params, caller: caller)
                 }
             }
         }

@@ -14,6 +14,7 @@ export const computerUseSettingsSchema = z.object({
   injectProviders: z.array(z.string()).default(SUPPORTED_PROVIDERS.map((provider) => provider.id)),
   extraBlockedBundleIds: z.array(z.string()).default([]),
   screenshots: z.enum(["auto", "always", "never"]).default("auto"),
+  allowBrowserApps: z.boolean().default(false),
 });
 
 export type ComputerUseSettingsValues = z.infer<typeof computerUseSettingsSchema>;

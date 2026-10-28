@@ -64,7 +64,10 @@ Gates after the fixes: `npx tsc --noEmit` exit 0; `npm run lint` 0 errors;
   `action_failed` ("window … closed") until `get_app_state` runs again.
 - **Oh My Pi adds an `i` (intent) field to every tool call.** The plugin's strict schemas reject
   it (`invalid_arguments … Unrecognized key`); the agent retries without it, so each run loses one
-  or two calls. Accepting a host-specific key is a schema design choice and was not changed.
+  or two calls. Fixed after QA: a string `i` is dropped before parsing; other unknown
+  keys still fail (`test/mcp-tools.test.ts` "ignores the intent field Oh My Pi adds…"). Live check
+  at 10:15Z under ABC: a real Oh My Pi agent sent `i` on all 8 calls (`status` through `set_value`),
+  0 `invalid_arguments`, and the oracle read `Untitled 24` = `xin chào` (NFC).
 - **"The window shows in `list_windows` but the snapshot did not include it"** (a Claude agent in
   the follow-up run) is not a plugin bug. From 03:25:16Z to 03:25:23Z the on-screen window list
   and the AX tree both had no TextEdit window (header `window: 0`, no `AXWindow`); at 03:25:28Z

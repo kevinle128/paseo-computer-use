@@ -35,6 +35,16 @@ export class ElementIds {
     return this.byApp.get(app)?.get(elementIndex);
   }
 
+  // The index the latest snapshot of `app` gave to a native id, if it numbered it.
+  indexOf(app: string, nativeId: string): number | undefined {
+    for (const [index, element] of this.byApp.get(app) ?? []) {
+      if (element.nativeId === nativeId) {
+        return index;
+      }
+    }
+    return undefined;
+  }
+
   // The native ids in index order. Two reads with the same key give every
   // index the same native id, so a diff between them cannot hide a renumbering.
   mappingKey(app: string): string {

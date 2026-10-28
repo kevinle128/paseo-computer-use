@@ -6,6 +6,7 @@ import {
   ComputerUseError,
   ComputerUseTransportError,
   HELPER_ERROR_CODES,
+  toToolErrorCode,
 } from "../server/computer-use-mcp/contract/errors";
 import type { HelperUnsolicitedEvent } from "../server/computer-use-mcp/contract/helper-protocol";
 import {
@@ -147,7 +148,41 @@ rl.on("line", (line) => {
         error: {
           code: "app_blocked",
           message: "App is denied",
+          bundleId: "com.example.Denied",
         },
+      }) + "\n");
+      return;
+    }
+    if (req.params?.app === "failed-after-focus-change") {
+      process.stdout.write(JSON.stringify({
+        id: req.id,
+        ok: false,
+        error: {
+          code: "accessibility_error",
+          message: "Failed",
+          userFocusChanged: "user_focus_changed: com.a -> com.b",
+          focusWatchDetail: "focus_watch: user_switched key_down_idle=0.100s",
+        },
+      }) + "\n");
+      return;
+    }
+    if (req.params?.app === "user-active") {
+      process.stdout.write(JSON.stringify({
+        id: req.id,
+        ok: false,
+        error: {
+          code: "user_active",
+          message: "The user is using TextEdit. Wait a few seconds, call get_app_state again, then retry.",
+          userActivityDetail: "user_active: rule=key_frontmost key_down_idle=1.000s mouse_down_idle=infs scroll_idle=infs pause=3.000s",
+        },
+      }) + "\n");
+      return;
+    }
+    if (req.params?.app === "window-gone") {
+      process.stdout.write(JSON.stringify({
+        id: req.id,
+        ok: false,
+        error: { code: "window_gone", message: "Window 77 is closed.", windowId: 77 },
       }) + "\n");
       return;
     }
@@ -226,7 +261,40 @@ describe("HelperProcess & Helper utilities", () => {
     ).rejects.toMatchObject({
       name: "ComputerUseError",
       code: "app_blocked",
+      bundleId: "com.example.Denied",
     });
+  });
+
+  it("keeps the focus change line of a failed action on the error", async () => {
+    const helper = createFakeHelper();
+    await expect(
+      helper.request("click", { blockedBundleIds: [], app: "failed-after-focus-change", x: 10, y: 10 }),
+    ).rejects.toMatchObject({
+      code: "accessibility_error",
+      userFocusChanged: "user_focus_changed: com.a -> com.b",
+      focusWatchDetail: "focus_watch: user_switched key_down_idle=0.100s",
+    });
+  });
+
+  it("keeps the idle times of a user_active refusal as data, apart from the message", async () => {
+    const helper = createFakeHelper();
+    const error = await helper
+      .request("click", { blockedBundleIds: [], app: "user-active", x: 10, y: 10 })
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      name: "ComputerUseError",
+      code: "user_active",
+      userActivityDetail: "user_active: rule=key_frontmost key_down_idle=1.000s mouse_down_idle=infs scroll_idle=infs pause=3.000s",
+    });
+    expect(toToolErrorCode(error)).toBe("user_active");
+    expect((error as Error).message).not.toMatch(/\d/);
+  });
+
+  it("keeps the window id of a window_gone error as data", async () => {
+    const helper = createFakeHelper();
+    await expect(
+      helper.request("click", { blockedBundleIds: [], app: "window-gone", x: 10, y: 10 }),
+    ).rejects.toMatchObject({ code: "window_gone", windowId: 77 });
   });
 
   it("rejects timed-out requests with ComputerUseTransportError", async () => {

@@ -3,6 +3,7 @@ import type {
   ActionExecutionResult,
   AppDescriptor,
   AppStateResult,
+  CaptureSignatureResult,
   Direction,
   ElementExpectation,
   HelperStatusResult,
@@ -14,9 +15,11 @@ import type {
 
 // Every command that names or lists apps carries the plugin's block list. The
 // helper refuses a command without it, so the plugin stays the one source of
-// the list.
+// the list. The prefixes are optional and block every bundle id that starts
+// with one of them.
 interface AppCommandParams {
   blockedBundleIds: string[];
+  blockedBundleIdPrefixes?: string[];
 }
 
 // Commands that move the virtual pointer may name the agent in control. The
@@ -24,6 +27,14 @@ interface AppCommandParams {
 // older plugin that never sends it still works.
 interface PointerCommandParams {
   overlayLabel?: string;
+}
+
+// The window an action targets: the one the agent read, or one it named. The
+// helper acts on this window or fails with `window_gone`; it never picks
+// another window when the named one is closed. Without it the helper uses the
+// window of the latest read of the app, then the app's own pick.
+interface WindowCommandParams {
+  windowId?: number;
 }
 
 export interface HelperCommands {
@@ -42,12 +53,30 @@ export interface HelperCommands {
   get_app_state: {
     params: AppCommandParams & {
       app: string;
+      // The window to read. The app's focused window when omitted. A window
+      // that is not open fails with `window_gone`.
+      windowId?: number;
       includeScreenshot?: boolean;
+      // False reads without replacing the helper's element cache and cached
+      // window. Every read the agent did not ask for sets it, so an action
+      // still resolves against the read the agent saw.
+      cache?: boolean;
     };
     result: AppStateResult;
   };
+  // A small grayscale thumbnail of one window (or a region of it, in window
+  // points) for comparing two moments. The full image never leaves the helper.
+  "capture.signature": {
+    params: AppCommandParams & {
+      app: string;
+      // Must belong to `app`. The app's main window when omitted.
+      windowId?: number;
+      region?: { x: number; y: number; width: number; height: number };
+    };
+    result: CaptureSignatureResult;
+  };
   click: {
-    params: AppCommandParams & PointerCommandParams & {
+    params: AppCommandParams & PointerCommandParams & WindowCommandParams & {
       app: string;
       x?: number;
       y?: number;
@@ -64,7 +93,7 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   drag: {
-    params: AppCommandParams & PointerCommandParams & {
+    params: AppCommandParams & PointerCommandParams & WindowCommandParams & {
       app: string;
       fromX: number;
       fromY: number;
@@ -75,7 +104,7 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   scroll: {
-    params: AppCommandParams & PointerCommandParams & {
+    params: AppCommandParams & PointerCommandParams & WindowCommandParams & {
       app: string;
       x?: number;
       y?: number;
@@ -90,7 +119,7 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   press_key: {
-    params: AppCommandParams & {
+    params: AppCommandParams & WindowCommandParams & {
       app: string;
       key: string;
       duration?: number;
@@ -98,7 +127,7 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   type_text: {
-    params: AppCommandParams & {
+    params: AppCommandParams & WindowCommandParams & {
       app: string;
       text: string;
       // The only element reference the helper accepts: indices are a
@@ -113,15 +142,19 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   paste_text: {
-    params: AppCommandParams & {
+    params: AppCommandParams & WindowCommandParams & {
       app: string;
       text: string;
       format?: PasteFormat;
+      // The element to focus before pasting, with the element as this agent
+      // last saw it (as for type_text).
+      nativeId?: string;
+      expected?: ElementExpectation;
     };
     result: ActionExecutionResult;
   };
   set_value: {
-    params: AppCommandParams & {
+    params: AppCommandParams & WindowCommandParams & {
       app: string;
       nativeId: string;
       expected: ElementExpectation;
@@ -130,7 +163,7 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   select_text: {
-    params: AppCommandParams & {
+    params: AppCommandParams & WindowCommandParams & {
       app: string;
       nativeId: string;
       expected: ElementExpectation;
@@ -142,7 +175,7 @@ export interface HelperCommands {
     result: ActionExecutionResult;
   };
   perform_secondary_action: {
-    params: AppCommandParams & {
+    params: AppCommandParams & WindowCommandParams & {
       app: string;
       nativeId: string;
       expected: ElementExpectation;
@@ -186,6 +219,15 @@ export interface HelperResponseEnvelope<T = unknown> {
   error?: {
     code: HelperErrorCode;
     message: string;
+    userFocusChanged?: string;
+    // The input idle times behind a focus watch outcome, for the audit log.
+    focusWatchDetail?: string;
+    // The window a `window_gone` error is about.
+    windowId?: number;
+    // The bundle id an `app_blocked` error refused.
+    bundleId?: string;
+    // The rule and input idle times behind a `user_active` refusal, for the audit log.
+    userActivityDetail?: string;
   };
 }
 

@@ -14,7 +14,7 @@ import {
   ControlLock,
   type PolicyEngineConfig,
 } from "./policy";
-import { ActionSettler } from "./runtime/action-settler";
+import { ActionSettler, type ActionSettlerClock } from "./runtime/action-settler";
 
 export * from "./ax/accessibility-tree";
 export * from "./ax/element-ids";
@@ -42,6 +42,7 @@ export interface ComputerUseRuntimeSettings {
   enabled: boolean;
   extraBlockedBundleIds: string[];
   screenshots: "auto" | "always" | "never";
+  allowBrowserApps: boolean;
 }
 
 export interface ComputerUseServiceStatus {
@@ -65,6 +66,8 @@ export interface CreateComputerUseServiceDeps {
   platformSupported?: boolean;
   idleLockTimeoutMs?: number;
   postActionSleepMs?: number;
+  // The clock wait_for polls with. Tests pass a fake one.
+  waitClock?: ActionSettlerClock;
   getSettings?: () => Partial<ComputerUseRuntimeSettings>;
   getHelperBuildStatus?: () => {
     state: "idle" | "building" | "ready" | "failed";
@@ -105,6 +108,7 @@ export function createComputerUseService(
       enabled: raw.enabled ?? false,
       extraBlockedBundleIds: raw.extraBlockedBundleIds ?? [],
       screenshots: raw.screenshots ?? "auto",
+      allowBrowserApps: raw.allowBrowserApps ?? false,
     };
   };
 
@@ -224,6 +228,7 @@ export function createComputerUseService(
     auditLog,
     getExtraBlockedBundleIds: () => getSettings().extraBlockedBundleIds,
     isEnabled: () => getSettings().enabled,
+    allowBrowserApps: () => getSettings().allowBrowserApps,
   };
 
   // The plugin's own client -> agent map wins over the agent id in the
@@ -318,6 +323,7 @@ export function createComputerUseService(
         driver: session.driver,
         getStatus,
         getScreenshotMode: () => getSettings().screenshots,
+        ...(deps.waitClock ? { waitClock: deps.waitClock } : {}),
       },
     });
   };

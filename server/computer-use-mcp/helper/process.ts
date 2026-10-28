@@ -390,6 +390,17 @@ export class HelperProcess implements HelperPort {
           message: errMsg,
           request: entry.params,
           requestType: entry.cmd,
+          ...(typeof envelope.error?.userFocusChanged === "string"
+            ? { userFocusChanged: envelope.error.userFocusChanged }
+            : {}),
+          ...(typeof envelope.error?.focusWatchDetail === "string"
+            ? { focusWatchDetail: envelope.error.focusWatchDetail }
+            : {}),
+          ...(typeof envelope.error?.windowId === "number" ? { windowId: envelope.error.windowId } : {}),
+          ...(typeof envelope.error?.bundleId === "string" ? { bundleId: envelope.error.bundleId } : {}),
+          ...(typeof envelope.error?.userActivityDetail === "string"
+            ? { userActivityDetail: envelope.error.userActivityDetail }
+            : {}),
         }),
       );
     }
